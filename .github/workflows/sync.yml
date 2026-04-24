@@ -1,0 +1,98 @@
+name: Sync Garmin Widget
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'          # 每 15 分钟跑一次（GitHub 实际可能 15-25 分钟）
+  workflow_dispatch:                 # Actions 页面可手动触发
+
+concurrency:
+  group: sync-garmin
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write                # 允许 commit widget_data.json 回仓库
+      issues: write                  # 连续失败时开 issue 告警
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Restore Garmin token cache
+        uses: actions/cache@v4
+        with:
+          path: data/tokens
+          key: garmin-tokens-v1
+
+      - name: Run sync
+        env:
+          GARMIN_EMAIL:    ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          VDOT:            ${{ vars.VDOT || '50' }}
+          USER_NAME:       ${{ vars.USER_NAME || 'Runner' }}
+        run: python scripts/sync.py
+
+      - name: Save Garmin token cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/tokens
+          key: garmin-tokens-v1
+
+      - name: Commit widget_data.json
+        run: |
+          git config user.name  "garmin-bot"
+          git config user.email "garmin-bot@users.noreply.github.com"
+          git add data/widget_data.json
+          if git diff --cached --quiet; then
+            echo "No change."
+          else
+            git commit -m "chore: update widget_data $(date -u +%F\ %T)"
+            git push
+          fi
+
+      # 连续 3 次失败才开 issue 告警
+      - name: Alert on repeated failures
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'sync.yml',
+              per_page: 5, status: 'completed',
+            });
+            const recent = runs.data.workflow_runs.slice(0, 3);
+            const allFailed = recent.length === 3 && recent.every(r => r.conclusion === 'failure');
+            if (!allFailed) { core.info('Only this run failed, skip alert'); return; }
+            const existing = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'sync-failure', per_page: 1,
+            });
+            if (existing.data.length > 0) { core.info('Alert issue exists, skip'); return; }
+            await github.rest.issues.create({
+              owner, repo,
+              title: `⚠️ Garmin 同步连续失败 (${new Date().toISOString()})`,
+              labels: ['sync-failure'],
+              body: [
+                '最近 3 次 workflow run 全部失败，挂件数据将停滞。',
+                '',
+                '**最近 run**:',
+                ...recent.map(r => `- [${r.created_at}](${r.html_url}) · ${r.conclusion}`),
+                '',
+                '**常见原因**:',
+                '- Garmin 密码变更 / 触发二次验证 → 改 Secret',
+                '- Garmin API 临时故障 → 等下一轮',
+                '- Garmin API 字段变更 → 需要改 scripts/sync.py',
+              ].join('\n'),
+            });
