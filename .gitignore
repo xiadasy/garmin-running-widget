@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# 敏感/本地
+data/tokens/
+data/summary_7d.json
+data/activities_7d.json
+.env
